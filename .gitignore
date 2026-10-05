@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.tmp
+jobs.backup.json
+pages/
