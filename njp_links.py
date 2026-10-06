@@ -4,7 +4,7 @@ njp_links.py - collect the title + link of EVERY job on https://njp.gov.pk/jobs/
 
 Run:  python njp_links.py
 
-If the site drops a connection, the page is retried (5 tries, waiting longer each time).
+If the site drops a connection, the page is retried 2 times, waiting 10 seconds before each retry.
 If a page still fails, NOTHING is saved: a partial list would be wrong.
 """
 import json, re, sys, time
@@ -21,7 +21,8 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 DELAY = 3                                    # seconds between pages (be gentle)
-TRIES = 5                                    # attempts per page
+RETRIES = 2                                  # retries per page (after the first try)
+RETRY_WAIT = 10                              # seconds to wait before each retry
 MAX_PAGES = 50                               # safety limit
 OUT_FILE = "njp_links.json"
 
@@ -34,19 +35,18 @@ session.headers.update(HEADERS)
 
 
 def get_page(page):
-    """Download one list page. Retries when the site drops the connection."""
-    for attempt in range(1, TRIES + 1):
+    """Download one list page. Retries (RETRIES times) when the site drops the connection."""
+    for attempt in range(RETRIES + 1):
         try:
             r = session.get(BASE, params={"page": page} if page > 1 else None, timeout=30)
             r.raise_for_status()
             return r.text
         except requests.RequestException as e:
-            print(f"  page {page}, try {attempt}/{TRIES} failed: {type(e).__name__}")
-            if attempt == TRIES:
-                sys.exit(f"Page {page} failed {TRIES} times. Nothing saved. Try again later.")
-            wait = 5 * attempt                              # 5s, 10s, 15s, 20s
-            print(f"  waiting {wait}s, then retrying...")
-            time.sleep(wait)
+            print(f"  page {page} failed: {type(e).__name__}")
+            if attempt == RETRIES:
+                sys.exit(f"Page {page} failed after {RETRIES} retries. Nothing saved. Try again later.")
+            print(f"  retry {attempt + 1}/{RETRIES} in {RETRY_WAIT}s...")
+            time.sleep(RETRY_WAIT)
 
 
 jobs = {}                                    # id -> {"id", "title", "url"}

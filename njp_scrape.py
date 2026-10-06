@@ -6,6 +6,7 @@ downloaded twice), parses the fields and writes njp_jobs.json so you can CHECK
 the data before it goes to Supabase.
 
 Run:  python njp_scrape.py
+A dropped connection is retried 2 times (10 seconds apart).
 Safe to run again: pages already saved are reused. Delete a file in njp_pages/
 (or the whole folder) to download it again.
 """
@@ -25,7 +26,8 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 DELAY = 3                                    # seconds between page downloads (be gentle)
-TRIES = 5                                    # attempts per page
+RETRIES = 2                                  # retries per page (after the first try)
+RETRY_WAIT = 10                              # seconds to wait before each retry
 
 session = requests.Session()
 session.headers.update(HEADERS)
@@ -33,16 +35,17 @@ session.headers.update(HEADERS)
 
 # ------------------------------------------------------------------ download
 def get_html(url):
-    """Download one page. Retries when the site drops the connection. None = gave up."""
-    for attempt in range(1, TRIES + 1):
+    """Download one page. Retries (RETRIES times) when the site drops the connection. None = gave up."""
+    for attempt in range(RETRIES + 1):
         try:
             r = session.get(url, timeout=30)
             r.raise_for_status()
             return r.text
         except requests.RequestException as e:
-            print(f"  try {attempt}/{TRIES} failed: {type(e).__name__}")
-            if attempt < TRIES:
-                time.sleep(5 * attempt)              # 5s, 10s, 15s, 20s
+            print(f"  failed: {type(e).__name__}")
+            if attempt < RETRIES:
+                print(f"  retry {attempt + 1}/{RETRIES} in {RETRY_WAIT}s...")
+                time.sleep(RETRY_WAIT)
     return None
 
 
