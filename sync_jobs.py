@@ -270,14 +270,14 @@ def get_db():
     return create_client(url, key)
 
 
-def table(db):
-    return db.schema(DB_SCHEMA).table(DB_TABLE)
+def table(db, tbl=None):
+    return db.schema(DB_SCHEMA).table(tbl or DB_TABLE)
 
 
-def db_read(db, columns, only_active=False):
+def db_read(db, columns, only_active=False, tbl=None):
     out, start = [], 0
     while True:                              # PostgREST returns max 1000 rows per request
-        q = table(db).select(columns)
+        q = table(db, tbl).select(columns)
         if only_active:
             q = q.eq("is_active", True)
         rows = q.order("id").range(start, start + 999).execute().data
@@ -287,19 +287,19 @@ def db_read(db, columns, only_active=False):
         start += 1000
 
 
-def db_upsert(db, rows):
+def db_upsert(db, rows, tbl=None):
     rows = [{**json.loads(json.dumps(r)), "is_active": True} for r in rows]   # int keys -> str
     for i in range(0, len(rows), 100):
-        table(db).upsert(rows[i:i + 100], on_conflict="id").execute()
+        table(db, tbl).upsert(rows[i:i + 100], on_conflict="id").execute()
 
 
-def db_retire(db, ids):
+def db_retire(db, ids, tbl=None):
     if not ids:
         return
     if DB_HARD_DELETE:
-        table(db).delete().in_("id", ids).execute()
+        table(db, tbl).delete().in_("id", ids).execute()
     else:
-        table(db).update({"is_active": False}).in_("id", ids).execute()
+        table(db, tbl).update({"is_active": False}).in_("id", ids).execute()
 
 
 # ---------------------------------------------------------------------- sync
