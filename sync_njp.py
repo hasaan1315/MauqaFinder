@@ -117,25 +117,84 @@ def get_description(lines):
     return "\n".join(out).strip() or None
 
 
-def get_qualifications(lines):
-    """Degree names listed under Eligibility Criteria > Qualifications."""
+# Patterns to extract qualification names from free text in the description
+_QUAL_FROM_DESC_RE = re.compile(
+    r'\b((?:PhD|Ph\.D\.?|Doctorate|MS|M\.S\.?|MPhil|M\.Phil\.?|LLM|MBA|M\.B\.A\.?|'
+    r'MSc|M\.Sc\.?|MCS|MPA|MEd|MCom|MA|ACCA|ACMA|CA|'
+    r'BS|B\.S\.?|BSCS|BSIT|BBA|BE|B\.E\.?|B\.?\s?Tech|B\.?\s?Eng|MBBS|BDS|Pharm-?D|DVM|LLB|'
+    r'Bachelors?|B\.?\s?Sc\.?|B\.?\s?A\.?|B\.?\s?Com\.?|'
+    r'FSc|F\.Sc\.?|Intermediate|Matric|DAE)'
+    r'(?:[^.\n]{0,60}?)?)(?=[.,;\n]|$)',
+    re.I
+)
+
+
+# Matches: "minimum 10 years", "at least 3 to 5 years", "7-10 years experience", "3+ years experience"
+_EXP_FROM_DESC_RE = re.compile(
+    r'(?:minimum\s+of|minimum|at\s+least)\s*(\d+)\s*(?:to|-|\u2013)\s*(\d+)\s*years?\s*(?:of\s+)?(?:relevant\s+)?experience'
+    r'|(?:minimum\s+of|minimum|at\s+least)\s*(\d+)\+?\s*years?\s*(?:of\s+)?(?:relevant\s+)?experience'
+    r'|(\d+)\s*(?:to|-|\u2013)\s*(\d+)\s*years?\s*(?:of\s+)?(?:relevant\s+)?experience'
+    r'|(\d+)\+\s*years?\s*(?:of\s+)?(?:relevant\s+)?experience',
+    re.I
+)
+
+
+def _exp_from_description(soup):
+    """Fallback: extract minimum experience years from the job-description-container HTML."""
+    container = soup.find(id="job-description-container")
+    if container is None:
+        return None
+    text = container.get_text(" ", strip=True)
+    m = _EXP_FROM_DESC_RE.search(text)
+    if not m:
+        return None
+    g1, g2, g3, g4, g5, g6 = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6)
+    if g1 and g2:   # "3 to 5 years" range with minimum/at least prefix
+        return min(int(g1), int(g2))
+    if g3:          # "minimum 10 years"
+        return int(g3)
+    if g4 and g5:   # "3-5 years experience" bare range
+        return min(int(g4), int(g5))
+    if g6:          # "3+ years experience"
+        return int(g6)
+    return None
+
+
+def _quals_from_description(soup):
+    """Fallback: extract qualification names from the job-description-container HTML."""
+    container = soup.find(id="job-description-container")
+    if container is None:
+        return []
+    text = container.get_text(" ", strip=True)
+    # Look for explicit qualification sentences
+    found = []
+    for m in _QUAL_FROM_DESC_RE.finditer(text):
+        q = m.group(0).strip().rstrip('.,;')
+        if q and q not in found:
+            found.append(q)
+    return found
+
+
+def get_qualifications(lines, soup=None):
+    """Degree names listed under Eligibility Criteria > Qualifications.
+    Falls back to extracting from the description HTML when the section is empty."""
     elig = next((i for i, l in enumerate(lines) if norm(l) == "eligibility criteria"), None)
     if elig is None:
-        return []
+        return _quals_from_description(soup) if soup else []
     start = next((i for i in range(elig, len(lines)) if norm(lines[i]) == "qualifications"), None)
     if start is None:
-        return []
+        return _quals_from_description(soup) if soup else []
     out = []
     for l in lines[start + 1:]:
         if norm(l) in {"read more", "experience", "age limit", "application deadline"}:
             break
         if l.strip():
             out.append(l.strip())
-    return out
+    return out if out else (_quals_from_description(soup) if soup else [])
 
 
 def read_page(html):
-    """-> (h1 title, text lines, all text in one line, 'Quick Overview' block)"""
+    """-> (h1 title, text lines, all text in one line, 'Quick Overview' block, soup)"""
     soup = BeautifulSoup(html, "lxml")
     h1 = soup.find("h1")
     h1_text = h1.get_text(" ", strip=True) if h1 else None
@@ -146,7 +205,7 @@ def read_page(html):
     qo = ""
     if "Quick Overview" in flat:                              # Posted / Deadline / Vacancies / ...
         qo = flat.split("Quick Overview", 1)[1].split("About Employer", 1)[0]
-    return h1_text, lines, flat, qo
+    return h1_text, lines, flat, qo, soup
 
 
 AGE_STOP = {"age limit", "minimum age limit", "application deadline", "read more", "quick overview",
@@ -191,7 +250,7 @@ def parse_age(text, bare="max"):
 
 
 def parse_job(job_id, list_title, html):
-    h1_text, lines, flat, qo = read_page(html)
+    h1_text, lines, flat, qo, soup = read_page(html)
     title = h1_text or list_title
 
     employer = None
@@ -202,10 +261,14 @@ def parse_job(job_id, list_title, html):
 
     vac = re.search(r"Vacancies:?\s*(\d+)", qo) or re.search(r"(\d+)\s*vacanc", flat, re.I)
 
-    exp = None
+    exp_years = None
     m = re.search(r"Experience:?\s*(?:(\d+)\s*\+?\s*years?|(no\s*experience))", qo, re.I)
     if m:
-        exp = int(m.group(1)) if m.group(1) else 0
+        exp_years = int(m.group(1)) if m.group(1) else 0
+    if exp_years is None:                                    # fallback: parse from description HTML
+        exp_years = _exp_from_description(soup)
+    # Store as array [{"all": N}] so the mart can handle it uniformly with Punjab's per-edu arrays
+    exp = [{"all": exp_years}] if exp_years is not None else []
 
     age_min = age_max = None
     for text, bare in age_texts(lines, qo):
@@ -229,7 +292,7 @@ def parse_job(job_id, list_title, html):
         "experience_years": exp,
         "age_min": age_min,
         "age_max": age_max,
-        "qualifications": get_qualifications(lines),
+        "qualifications": get_qualifications(lines, soup),
         "description": get_description(lines),
         "job_posted": find_date(qo, "Posted"),
         "last_date_to_apply": deadline,

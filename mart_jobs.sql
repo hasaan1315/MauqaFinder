@@ -16,7 +16,8 @@
 --   employment_type         employment_status                       job_type
 --   grade                   level  ('N/A' -> null)                  grade
 --   vacancies               total_position                          vacancies
---   experience_years        smallest value in years_of_experience   experience_years
+--   experience_years        min exp across all edu levels            min exp from [{"all":N}]
+--   experience_breakdown     [{edu_years,exp_years},...] array        [{edu_years:null,exp_years:N}]
 --   education_level_years   education_level_years (site number)     DERIVED from degree names (rules below)
 --   age_min, age_max        age_min, age_max                        age_min, age_max
 --   salary_min, _max        salary_min, salary_max                  null (NJP does not publish it)
@@ -30,6 +31,21 @@
 
 create schema if not exists mart;
 
+-- Migrate raw.njp_jobs.experience_years from integer to jsonb
+-- (sync_njp.py now stores [{"all": N}] arrays instead of a plain int)
+do $$
+begin
+  if (select data_type from information_schema.columns
+      where table_schema = 'raw' and table_name = 'njp_jobs'
+        and column_name = 'experience_years') = 'integer' then
+    alter table raw.njp_jobs
+      alter column experience_years type jsonb
+      using case when experience_years is null then null
+                 else jsonb_build_array(jsonb_build_object('all', experience_years))
+            end;
+  end if;
+end;
+$$;
 -- =====================================================================================
 -- 1. DEGREE RULES: degree name -> years of education (NJP lists names, not years)
 --    First matching rule (lowest rank) wins for each degree name. Patterns are
@@ -125,11 +141,20 @@ from (
     p.employment_status                                            as employment_type,
     case when p.level ilike '%n/a%' then null else p.level end     as grade,
     p.total_position                                               as vacancies,
-    -- years_of_experience looks like [{"16": 10}, {"12": 15}]; keep the smallest requirement
+    -- years_of_experience: [{"16": 5}, {"12": 10}] -> minimum exp value across all edu levels
     (select min(v.value::int)
        from jsonb_array_elements(coalesce(p.years_of_experience, '[]'::jsonb)) as e,
             jsonb_each_text(case when jsonb_typeof(e) = 'object' then e else '{}'::jsonb end) as v
     )                                                              as experience_years,
+    -- full array kept for display: [{"edu_years": 16, "exp_years": 5}, ...]
+    coalesce(
+      (select jsonb_agg(jsonb_build_object('edu_years', (kv).key::int, 'exp_years', (kv).value::int))
+         from jsonb_array_elements(coalesce(p.years_of_experience, '[]'::jsonb)) as e,
+              lateral jsonb_each_text(case when jsonb_typeof(e) = 'object' then e else '{}'::jsonb end) as kv
+         where (kv).key ~ '^\d+$'
+      ),
+      '[]'::jsonb
+    )                                                              as experience_breakdown,
     p.education_level_years                                        as education_level_years,
     p.age_min                                                      as age_min,
     p.age_max                                                      as age_max,
@@ -155,7 +180,20 @@ from (
     n.job_type,
     n.grade,
     n.vacancies,
-    n.experience_years,
+    -- experience_years: [{"all": N}] -> extract the single value
+    (select (e -> 'all')::int
+       from jsonb_array_elements(coalesce(n.experience_years, '[]'::jsonb)) as e
+       where e ? 'all'
+       limit 1
+    ),
+    -- experience_breakdown: [{"edu_years": null, "exp_years": N}] for uniform display
+    coalesce(
+      (select jsonb_agg(jsonb_build_object('edu_years', null, 'exp_years', (e -> 'all')::int))
+         from jsonb_array_elements(coalesce(n.experience_years, '[]'::jsonb)) as e
+         where e ? 'all'
+      ),
+      '[]'::jsonb
+    ),
     mart.parse_education_years(n.qualifications),
     n.age_min,
     n.age_max,
