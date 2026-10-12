@@ -29,7 +29,7 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 
-import sync_jobs as base                                  # database helpers
+import sync_pjp as base                                  # database helpers
 
 LIST_URL = "https://njp.gov.pk/jobs/live"
 TABLE = "njp_jobs"                                        # raw.njp_jobs
