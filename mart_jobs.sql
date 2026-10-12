@@ -124,7 +124,7 @@ order by jobs desc, q.txt;
 -- =====================================================================================
 drop view if exists mart.jobs;
 
-create view mart.jobs as
+create or replace view mart.jobs as
 select
   u.*,
   (u.is_active
@@ -141,12 +141,10 @@ from (
     p.employment_status                                            as employment_type,
     case when p.level ilike '%n/a%' then null else p.level end     as grade,
     p.total_position                                               as vacancies,
-    -- years_of_experience: [{"16": 5}, {"12": 10}] -> minimum exp value across all edu levels
     (select min(v.value::int)
        from jsonb_array_elements(coalesce(p.years_of_experience, '[]'::jsonb)) as e,
             jsonb_each_text(case when jsonb_typeof(e) = 'object' then e else '{}'::jsonb end) as v
     )                                                              as experience_years,
-    -- full array kept for display: [{"edu_years": 16, "exp_years": 5}, ...]
     coalesce(
       (select jsonb_agg(jsonb_build_object('edu_years', (kv).key::int, 'exp_years', (kv).value::int))
          from jsonb_array_elements(coalesce(p.years_of_experience, '[]'::jsonb)) as e,
@@ -165,7 +163,8 @@ from (
     p.last_date_to_apply                                           as last_date_to_apply,
     'https://jobs.punjab.gov.pk/new_recruit/job_detail/' || p.id   as job_url,
     p.is_active                                                    as is_active,
-    p.scraped_at                                                   as scraped_at
+    p.scraped_at                                                   as scraped_at,
+    initcap(lower(p.district))                                     as district
   from raw.punjab_jobs_portal p
 
   union all
@@ -180,13 +179,11 @@ from (
     n.job_type,
     n.grade,
     n.vacancies,
-    -- experience_years: [{"all": N}] -> extract the single value
     (select (e -> 'all')::int
        from jsonb_array_elements(coalesce(n.experience_years, '[]'::jsonb)) as e
        where e ? 'all'
        limit 1
     ),
-    -- experience_breakdown: [{"edu_years": null, "exp_years": N}] for uniform display
     coalesce(
       (select jsonb_agg(jsonb_build_object('edu_years', null, 'exp_years', (e -> 'all')::int))
          from jsonb_array_elements(coalesce(n.experience_years, '[]'::jsonb)) as e
@@ -204,9 +201,12 @@ from (
     n.last_date_to_apply,
     n.url,
     n.is_active,
-    n.scraped_at
+    n.scraped_at,
+    'All Pakistan'::text                                           as district
   from raw.njp_jobs n
 ) u;
+
+GRANT SELECT ON mart.jobs TO postgres, service_role, anon, authenticated;
 
 -- the scraper side (secret key = service_role) can read it
 grant usage on schema mart to service_role;
