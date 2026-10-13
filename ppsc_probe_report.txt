@@ -1,0 +1,32 @@
+final address            : https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/Jobs.aspx
+session id in the address: yes
+__VIEWSTATE present      : yes
+__EVENTVALIDATION present: yes
+__doPostBack calls       : 0  (paging/detail links that need a form post)
+tables / rows            : 2 / 15
+links                    : 50 (pdf: 4)
+images (maybe adverts)   : 0
+
+first 20 links:
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/Default.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/Jobs.aspx#
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/Default.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/Jobs.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/InformationDesk.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/Syllabus.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/JobDescription.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/GuidanceForEligibilityCriteria.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/Schedule.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/ExamsSchedules.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/Interviews.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/~/Results.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/FinalResults.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/FinalResultMeritList.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/WrittenResults.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/DMCPage.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/PPSCRegulations.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/PressRelease.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/JobsArchive.aspx
+  https://www.ppsc.gop.pk/(S(j05j4ra24faxxdenr1p1obir))/HighlightsArchive.aspx
+
+first 10 postback targets:
