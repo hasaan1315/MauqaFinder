@@ -1,14 +1,15 @@
 """
 sync_ppsc.py - keep the Supabase table raw.ppsc_jobs in sync with PPSC active jobs.
 
-Handles ASP.NET __VIEWSTATE form submissions to click into individual job detail
-pages and extract deep information like Qualifications, Vacancies, and Eligibility.
+Now uses DELTA-SYNC logic: It only performs the heavy ASP.NET POST requests
+and HTML parsing for jobs that are NEW, REACTIVATED, or CHANGED.
 """
 import os
 import re
 import sys
 import time
-from datetime import datetime
+import json
+from datetime import datetime, date
 
 import requests
 from bs4 import BeautifulSoup
@@ -17,6 +18,9 @@ import sync_pjp as base  # shared Supabase database helpers
 
 START_URL = "https://www.ppsc.gop.pk/Jobs.aspx"
 TABLE = "ppsc_jobs"
+PAGES_DIR = "ppsc_pages"
+DETECT_CHANGES = True
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -61,7 +65,6 @@ def parse_experience(text):
         clean_text = re.sub(rf'\b{word}\b', num, clean_text)
         
     # Super-flexible regex: Looks for "digits" + "years" + up to 10 intermediate words + "experience"
-    # This effortlessly handles "3 year's post-bachelor's degree practical experience"
     match = re.search(r"(\d+)\s*(?:years?|yrs?)['\s]*s?(?:\s+[\w\'-]+){0,10}\s+experience", clean_text)
     
     if match:
@@ -71,104 +74,18 @@ def parse_experience(text):
     fallback_match = re.search(r"(\d+)\s*(?:[\w\s,\'-]+){0,15}years?['\s]*s?\s+experience", clean_text)
     return int(fallback_match.group(1)) if fallback_match else 0
 
-def extract_job_details(html, case_no, title, department, fee, closing_date, url):
-    """Parses the deep detail page for rich fields."""
-    soup = BeautifulSoup(html, "lxml")
-    
-    for t in soup(["script", "style"]):
-        t.decompose()
-        
-    text = soup.get_text(" ", strip=True)
-    
-    # 1. Vacancies
-    vac_match = re.search(r'Total Number of Posts:\s*(\d+)', text, re.I)
-    vacancies = int(vac_match.group(1)) if vac_match else 1
 
-    # 2. Grade / Pay Scale
-    grade_match = re.search(r'(BS-\d+|BPS-\d+)', text, re.I)
-    grade = grade_match.group(1).upper() if grade_match else None
-
-    # 3. Place of Posting
-    posting_match = re.search(r'Place Of Posting:\s*([A-Za-z\s,]+?)(?:Additional Requirement|Research|Preferences|Fee|$)', text, re.I)
-    place_of_posting = posting_match.group(1).strip() if posting_match else "Punjab"
-
-    # 4. Eligibility
-    elig_match = re.search(r'Eligibililty:\s*([^\n]+?)(?:Place Of Posting|$)', text, re.I)
-    eligibility = elig_match.group(1).strip() if elig_match else None
-
-    # 5. Qualification Text
-    qual_match = re.search(r'Qualification:\s*(.*?)(?:Total Number of Posts|Experience:|Pay Scale:|$)', text, re.I | re.DOTALL)
-    if qual_match:
-        qualification_text = qual_match.group(1).strip()
-        # Clean up weird leading bullets/parentheses and normalize "Graduation" for SQL parsing
-        qualification_text = re.sub(r'^[\)\(\]\}\s*]+', '', qualification_text)
-        qualification_text = re.sub(r'\bGraduation\b', "Bachelor's Degree", qualification_text, flags=re.I)
-    else:
-        qualification_text = None
-
-    # Experience Years via Parser helper
-    experience_years = parse_experience(qualification_text)
-
-    # 6. Age Parsing (Extracts min and max with gender relaxations)
-    age_min = age_max_male = age_max_female = None
-    age_match = re.search(r'Age:\s*(.*?)(?:Eligibililty:|Eligibility:|Place Of Posting:|Fee:|Gender:|$)', text, re.I)
-    
-    if age_match:
-        age_text = age_match.group(1)
-        
-        male_match = re.search(r'Male:\s*(\d+)\s*to\s*(\d+)(?:\s*\+\s*\d+\s*=\s*(\d+))?', age_text, re.I)
-        if male_match:
-            age_min = int(male_match.group(1))
-            age_max_male = int(male_match.group(3)) if male_match.group(3) else int(male_match.group(2))
-            
-        female_match = re.search(r'Female:\s*\d+\s*to\s*(\d+)(?:\s*\+\s*\d+\s*=\s*(\d+))?', age_text, re.I)
-        if female_match:
-            age_max_female = int(female_match.group(2)) if female_match.group(2) else int(female_match.group(1))
-            
-        if not age_min and not age_max_male:
-            gen_match = re.search(r'(\d+)\s*to\s*(\d+)', age_text, re.I)
-            if gen_match:
-                age_min = int(gen_match.group(1))
-                age_max_male = int(gen_match.group(2))
-                age_max_female = int(gen_match.group(2))
-
-    record_id = re.sub(r'[^a-zA-Z0-9]', '_', case_no).lower()
-
-    return {
-        "id": record_id,
-        "title": title,
-        "department": department,
-        "grade": grade,
-        "vacancies": vacancies,
-        "description": f"{title} at {department}. Case No: {case_no}",
-        "qualification_text": qualification_text,
-        "experience_years": experience_years,
-        "eligibility": eligibility,
-        "place_of_posting": place_of_posting,
-        "fee": fee,
-        "closing_date": closing_date,
-        "url": url,
-        "age_min": age_min,
-        "age_max_male": age_max_male,
-        "age_max_female": age_max_female,
-        "is_active": True
-    }
-
-
-def fetch_jobs():
-    """Scrapes the main list, then deeply scrapes each job's detail page via ASP.NET postbacks."""
-    print("Fetching PPSC Jobs Table...")
+def fetch_list():
+    """Scrapes the main list lightly to get metadata without doing deep POSTs yet."""
     res = get_html(START_URL)
     if not res:
         sys.exit("Failed to reach PPSC landing page.")
     
     session_url = res.url 
     soup = BeautifulSoup(res.text, 'lxml')
-    live_jobs = {}
+    live_list = {}
 
     rows = soup.select("table tr")
-    job_targets = []
-
     for row in rows:
         cols = row.find_all("td")
         if len(cols) < 8:
@@ -199,90 +116,217 @@ def fetch_jobs():
                 target_id = match.group(1)
 
         if target_id:
-            job_targets.append({
+            record_id = re.sub(r'[^a-zA-Z0-9]', '_', case_no).lower()
+            live_list[record_id] = {
                 "case_no": case_no,
                 "title": title,
                 "department": department,
                 "fee": fee,
-                "closing_date": closing_date,
-                "target": target_id
-            })
+                "last_date": closing_date,
+                "target": target_id,
+                "session_url": session_url
+            }
 
-    print(f"Found {len(job_targets)} jobs. Fetching detail pages...")
-
-    for job in job_targets:
-        print(f" -> Fetching details for: {job['case_no']} | {job['title'][:30]}...")
-        
-        fresh_res = get_html(session_url)
-        fresh_soup = BeautifulSoup(fresh_res.text, 'lxml')
-        
-        viewstate = fresh_soup.select_one("#__VIEWSTATE")
-        eventval = fresh_soup.select_one("#__EVENTVALIDATION")
-        
-        if not viewstate:
-            continue
-
-        form_data = {
-            "__EVENTTARGET": job["target"],
-            "__EVENTARGUMENT": "",
-            "__VIEWSTATE": viewstate.get("value", ""),
-            "__EVENTVALIDATION": eventval.get("value", "") if eventval else ""
-        }
-
-        detail_res = get_html(session_url, method="POST", data=form_data)
-        if detail_res:
-            parsed_job = extract_job_details(
-                detail_res.text, 
-                job["case_no"], 
-                job["title"], 
-                job["department"], 
-                job["fee"], 
-                job["closing_date"], 
-                session_url
-            )
-            if parsed_job:
-                live_jobs[parsed_job["id"]] = parsed_job
-            else:
-                print(f"    WARNING: Could not parse details for {job['case_no']}")
-        
-        time.sleep(DELAY)
-
-    return live_jobs
+    return live_list
 
 
-def main(force=False):
-    live = fetch_jobs()
-    print(f"\nSuccessfully parsed {len(live)} detailed PPSC jobs.")
+def fetch_detail_html(job_info):
+    """Executes the heavy ASP.NET POST to grab deep details."""
+    fresh_res = get_html(job_info["session_url"])
+    if not fresh_res: return None
     
+    fresh_soup = BeautifulSoup(fresh_res.text, 'lxml')
+    viewstate = fresh_soup.select_one("#__VIEWSTATE")
+    eventval = fresh_soup.select_one("#__EVENTVALIDATION")
+    
+    if not viewstate:
+        return None
+
+    form_data = {
+        "__EVENTTARGET": job_info["target"],
+        "__EVENTARGUMENT": "",
+        "__VIEWSTATE": viewstate.get("value", ""),
+        "__EVENTVALIDATION": eventval.get("value", "") if eventval else ""
+    }
+
+    detail_res = get_html(job_info["session_url"], method="POST", data=form_data)
+    return detail_res.text if detail_res else None
+
+
+def extract_job_details(html, slug, job_info):
+    """Parses the deep detail page for rich fields."""
+    soup = BeautifulSoup(html, "lxml")
+    
+    for t in soup(["script", "style"]):
+        t.decompose()
+        
+    text = soup.get_text(" ", strip=True)
+    
+    vac_match = re.search(r'Total Number of Posts:\s*(\d+)', text, re.I)
+    vacancies = int(vac_match.group(1)) if vac_match else 1
+
+    grade_match = re.search(r'(BS-\d+|BPS-\d+)', text, re.I)
+    grade = grade_match.group(1).upper() if grade_match else None
+
+    posting_match = re.search(r'Place Of Posting:\s*([A-Za-z\s,]+?)(?:Additional Requirement|Research|Preferences|Fee|$)', text, re.I)
+    place_of_posting = posting_match.group(1).strip() if posting_match else "Punjab"
+
+    elig_match = re.search(r'Eligibililty:\s*([^\n]+?)(?:Place Of Posting|$)', text, re.I)
+    eligibility = elig_match.group(1).strip() if elig_match else None
+
+    qual_match = re.search(r'Qualification:\s*(.*?)(?:Total Number of Posts|Experience:|Pay Scale:|$)', text, re.I | re.DOTALL)
+    if qual_match:
+        qualification_text = qual_match.group(1).strip()
+        qualification_text = re.sub(r'^[\)\(\]\}\s*]+', '', qualification_text)
+        qualification_text = re.sub(r'\bGraduation\b', "Bachelor's Degree", qualification_text, flags=re.I)
+    else:
+        qualification_text = None
+
+    experience_years = parse_experience(qualification_text)
+
+    age_min = age_max_male = age_max_female = None
+    age_match = re.search(r'Age:\s*(.*?)(?:Eligibililty:|Eligibility:|Place Of Posting:|Fee:|Gender:|$)', text, re.I)
+    
+    if age_match:
+        age_text = age_match.group(1)
+        
+        male_match = re.search(r'Male:\s*(\d+)\s*to\s*(\d+)(?:\s*\+\s*\d+\s*=\s*(\d+))?', age_text, re.I)
+        if male_match:
+            age_min = int(male_match.group(1))
+            age_max_male = int(male_match.group(3)) if male_match.group(3) else int(male_match.group(2))
+            
+        female_match = re.search(r'Female:\s*\d+\s*to\s*(\d+)(?:\s*\+\s*\d+\s*=\s*(\d+))?', age_text, re.I)
+        if female_match:
+            age_max_female = int(female_match.group(2)) if female_match.group(2) else int(female_match.group(1))
+            
+        if not age_min and not age_max_male:
+            gen_match = re.search(r'(\d+)\s*to\s*(\d+)', age_text, re.I)
+            if gen_match:
+                age_min = int(gen_match.group(1))
+                age_max_male = int(gen_match.group(2))
+                age_max_female = int(gen_match.group(2))
+
+    return {
+        "id": slug,
+        "title": job_info["title"],
+        "department": job_info["department"],
+        "grade": grade,
+        "vacancies": vacancies,
+        "description": f"{job_info['title']} at {job_info['department']}. Case No: {job_info['case_no']}",
+        "qualification_text": qualification_text,
+        "experience_years": experience_years,
+        "eligibility": eligibility,
+        "place_of_posting": place_of_posting,
+        "fee": job_info["fee"],
+        "closing_date": job_info["last_date"],
+        "url": job_info["session_url"],
+        "age_min": age_min,
+        "age_max_male": age_max_male,
+        "age_max_female": age_max_female,
+        "is_active": True
+    }
+
+
+def main(refresh=False, force=False):
+    live = fetch_list()
+    print("Listed on PPSC site:", len(live))
     if not live:
-        sys.exit("No jobs fully parsed. Stopping.")
+        sys.exit("No jobs found on the site. Stopping. Nothing was changed.")
 
     db = base.get_db()
     try:
-        saved = base.db_read(db, "id,is_active", tbl=TABLE)
+        # Note: Your database uses "closing_date" for PPSC instead of "last_date_to_apply"
+        saved = base.db_read(db, "id,is_active,closing_date", tbl=TABLE)
     except Exception as e:
         sys.exit(f"Supabase connection error for {TABLE}: {e}")
 
-    known = {r["id"]: r["is_active"] for r in saved}
-    active = {i for i, k in known.items() if k}
+    known = {r["id"]: {"is_active": r["is_active"], "last_date": r["closing_date"]}
+             for r in saved}
+    active = {i for i, k in known.items() if k["is_active"]}
+    print(f"In Supabase: {len(active)} active ({len(known)} total)")
 
+    # ---- Delta Sync Logic ----
     new = [s for s in live if s not in known]
-    back = [s for s in live if s in known and not known[s]]
+    back = [s for s in live if s in known and not known[s]["is_active"]]
+    changed = []
+    
+    if DETECT_CHANGES:
+        changed = [s for s in live if s in active
+                   and live[s]["last_date"] and known[s]["last_date"]
+                   and live[s]["last_date"] != known[s]["last_date"]]
+
     gone = [s for s in active if s not in live]
 
     if active and len(gone) > max(3, len(active) // 2) and not force:
         sys.exit(f"Would remove {len(gone)} PPSC jobs. Run with --force if intentional.")
 
-    rows = [live[job_id] for job_id in list(live)]
+    # ---- Fetching & Parsing Only What's Needed ----
+    os.makedirs(PAGES_DIR, exist_ok=True)
+    todo = list(live) if refresh else new + back + changed
+    redownload = set(live) if refresh else set(back) | set(changed)
     
+    rows, c_new, c_back, c_upd, failed = [], 0, 0, 0, 0
+
+    print(f"Delta Engine: Skipping {len(live) - len(todo)} unchanged jobs. Fetching deep details for {len(todo)} jobs...")
+
+    for slug in todo:
+        path = os.path.join(PAGES_DIR, f"{slug}.html")
+        job_info = live[slug]
+        
+        try:
+            # Only POST and fetch from PPSC server if we don't have it saved locally, or if it changed
+            if slug in redownload or not os.path.exists(path):
+                html = fetch_detail_html(job_info)
+                if html:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(html)
+                    time.sleep(DELAY)
+                else:
+                    raise Exception("Failed to extract POST HTML")
+            else:
+                with open(path, encoding="utf-8") as f:
+                    html = f.read()
+            
+            parsed_job = extract_job_details(html, slug, job_info)
+            rows.append(parsed_job)
+            
+        except Exception as e:
+            failed += 1
+            print("FAIL", slug, e)
+            continue
+
+        if slug in new:
+            c_new += 1
+            print("NEW ", slug)
+        elif slug in back:
+            c_back += 1
+            print("BACK", slug)
+        else:
+            c_upd += 1
+            print("UPD ", slug)
+
+    # ---- Write to Supabase ----
     try:
-        base.db_upsert(db, rows, tbl=TABLE)
-        base.db_retire(db, gone, tbl=TABLE)
+        if rows:
+            base.db_upsert(db, rows, tbl=TABLE)
+        if gone:
+            base.db_retire(db, gone, tbl=TABLE)
     except Exception as e:
         sys.exit(f"Supabase write FAILED: {e}")
 
-    print(f"New: {len(new)} | Reactivated: {len(back)} | Removed: {len(gone)}")
+    # Clean up cached files for retired jobs
+    for slug in gone:
+        print("OFF ", slug)
+        p = os.path.join(PAGES_DIR, f"{slug}.html")
+        if os.path.exists(p):
+            os.remove(p)
 
+    active_now = len((active - set(gone)) | {r["id"] for r in rows})
+    print(f"\nNew: {c_new} | Reactivated: {c_back} | Updated: {c_upd} | "
+          f"Removed: {len(gone)} | Failed: {failed} | Active now: {active_now}")
+    
+    if not (c_new or c_back or c_upd or gone or failed):
+        print("No changes.")
 
 if __name__ == "__main__":
-    main(force="--force" in sys.argv)
+    main(refresh="--refresh" in sys.argv, force="--force" in sys.argv)
