@@ -78,26 +78,44 @@ def list_date(tr):
         return None
 
 
-def fetch_list():
-    # Uses session.get() instead of requests.get() to route through proxy
-    r = session.get(BASE, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
-    live = {}
-    for a in soup.find_all("a", href=re.compile(r"job_detail")):
-        url = urljoin(BASE, a["href"])
-        slug = url.rstrip("/").split("/")[-1]
-        if slug not in live:
-            live[slug] = {"title": a.get_text(strip=True), "url": url,
-                          "last_date": list_date(a.find_parent("tr"))}
-    return live
+def fetch_list(retries=2):
+    """Fetches the main job listing through ScraperAPI with retry handling."""
+    for attempt in range(retries):
+        try:
+            r = session.get(BASE, timeout=60)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "lxml")
+            live = {}
+            for a in soup.find_all("a", href=re.compile(r"job_detail")):
+                url = urljoin(BASE, a["href"])
+                slug = url.rstrip("/").split("/")[-1]
+                if slug not in live:
+                    live[slug] = {
+                        "title": a.get_text(strip=True), 
+                        "url": url,
+                        "last_date": list_date(a.find_parent("tr"))
+                    }
+            return live
+        except requests.RequestException as e:
+            print(f"  List fetch attempt {attempt + 1}/{retries} failed: {e}")
+            if attempt < retries - 1:
+                time.sleep(5)
+    
+    sys.exit("Failed to reach Punjab Job Portal list page after multiple retries.")
 
 
-def fetch_page(url):
-    # Uses session.get() instead of requests.get() to route through proxy
-    r = session.get(url, timeout=30)
-    r.raise_for_status()
-    return r.text
+def fetch_page(url, retries=2):
+    """Fetches individual detail pages with 60s timeout and retries."""
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=60)
+            r.raise_for_status()
+            return r.text
+        except requests.RequestException as e:
+            print(f"  Page fetch attempt {attempt + 1}/{retries} failed: {e}")
+            if attempt < retries - 1:
+                time.sleep(5)
+    raise Exception(f"Failed to fetch {url} after {retries} attempts.")
 
 
 # ------------------------------------------------------------------- parsing
