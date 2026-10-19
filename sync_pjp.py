@@ -2,7 +2,7 @@
 sync_jobs.py - keep the Supabase table raw.punjab_jobs_portal in sync with
 https://jobs.punjab.gov.pk/new_recruit/jobs
 
-Needs a .env file with SUPABASE_URL and SUPABASE_SECRET_KEY.
+Needs a .env file with SUPABASE_URL, SUPABASE_SECRET_KEY, and SCRAPERAPI_KEY.
 
 Every run compares the jobs listed on the site with the jobs stored in the table:
 
@@ -21,9 +21,10 @@ from datetime import datetime, date
 from urllib.parse import urljoin
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 
-try:                              # read SUPABASE_* from the .env file if python-dotenv is installed
+try:                               # read SUPABASE_* from the .env file if python-dotenv is installed
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
@@ -40,6 +41,24 @@ DB_SCHEMA = os.getenv("SUPABASE_SCHEMA", "raw")             # Supabase schema (R
 DB_TABLE = os.getenv("SUPABASE_TABLE", "punjab_jobs_portal")  # table for this source
 DB_HARD_DELETE = False           # False = expired jobs get is_active=false (soft delete)
                                  # True  = expired jobs are deleted from the table
+
+# --- SCRAPERAPI PROXY TUNNEL SETUP ---
+session = requests.Session()
+session.headers.update(HEADERS)
+
+api_key = os.getenv("SCRAPERAPI_KEY")
+if api_key:
+    print("Cloud Proxy Active: Routing traffic through ScraperAPI (Sticky IP)...")
+    proxy_url = f"http://scraperapi.session_number=123:{api_key}@proxy-server.scraperapi.com:8001"
+    session.proxies.update({
+        "http": proxy_url,
+        "https": proxy_url
+    })
+    session.verify = False
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+else:
+    print("WARNING: SCRAPERAPI_KEY not found. Running locally without proxy.")
+# -------------------------------------
 
 
 # ------------------------------------------------------------------ fetching
@@ -60,7 +79,8 @@ def list_date(tr):
 
 
 def fetch_list():
-    r = requests.get(BASE, headers=HEADERS, timeout=30)
+    # Uses session.get() instead of requests.get() to route through proxy
+    r = session.get(BASE, timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
     live = {}
@@ -74,7 +94,8 @@ def fetch_list():
 
 
 def fetch_page(url):
-    r = requests.get(url, headers=HEADERS, timeout=30)
+    # Uses session.get() instead of requests.get() to route through proxy
+    r = session.get(url, timeout=30)
     r.raise_for_status()
     return r.text
 
@@ -276,7 +297,7 @@ def table(db, tbl=None):
 
 def db_read(db, columns, only_active=False, tbl=None):
     out, start = [], 0
-    while True:                              # PostgREST returns max 1000 rows per request
+    while True:                                      # PostgREST returns max 1000 rows per request
         q = table(db, tbl).select(columns)
         if only_active:
             q = q.eq("is_active", True)
@@ -381,7 +402,8 @@ def main(refresh=False, force=False):
 
     # ---- write to Supabase ----
     try:
-        db_upsert(db, rows)
+        if rows:
+            db_upsert(db, rows)
         db_retire(db, gone)
     except Exception as e:
         sys.exit(f"Supabase write FAILED: {e}\n"

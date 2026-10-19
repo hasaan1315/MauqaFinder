@@ -12,9 +12,14 @@ import json
 from datetime import datetime, date
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
 import sync_pjp as base  # shared Supabase database helpers
+
+# Load environment variables (crucial for local testing)
+load_dotenv()
 
 START_URL = "https://www.ppsc.gop.pk/Jobs.aspx"
 TABLE = "ppsc_jobs"
@@ -30,6 +35,23 @@ RETRIES = 2
 
 session = requests.Session()
 session.headers.update(HEADERS)
+
+# --- SCRAPERAPI PROXY TUNNEL SETUP ---
+api_key = os.getenv("SCRAPERAPI_KEY")
+if api_key:
+    print("Cloud Proxy Active: Routing traffic through ScraperAPI (Sticky IP)...")
+    # session_number=123 forces sticky IP for PPSC ViewState tracking
+    proxy_url = f"http://scraperapi.session_number=123:{api_key}@proxy-server.scraperapi.com:8001"
+    session.proxies.update({
+        "http": proxy_url,
+        "https": proxy_url
+    })
+    # Disable SSL verification to prevent proxy handshake errors
+    session.verify = False
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+else:
+    print("WARNING: SCRAPERAPI_KEY not found. Running locally without proxy.")
+# -------------------------------------
 
 
 def get_html(url, method="GET", data=None):
