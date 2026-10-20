@@ -12,7 +12,6 @@ import json
 from datetime import datetime, date
 
 import requests
-import urllib3
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -27,48 +26,62 @@ PAGES_DIR = "ppsc_pages"
 DETECT_CHANGES = True
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 DELAY = 3
 RETRIES = 2
 
-session = requests.Session()
-session.headers.update(HEADERS)
-
-# --- SCRAPERAPI PROXY TUNNEL SETUP ---
+# --- SCRAPERAPI REST ENDPOINT SETUP ---
 api_key = os.getenv("SCRAPERAPI_KEY")
-if api_key:
-    print("Cloud Proxy Active: Routing traffic through ScraperAPI (Sticky IP)...")
-    # session_number=123 forces sticky IP for PPSC ViewState tracking
-    proxy_url = f"http://scraperapi.session_number=123:{api_key}@proxy-server.scraperapi.com:8001"
-    session.proxies.update({
-        "http": proxy_url,
-        "https": proxy_url
-    })
-    # Disable SSL verification to prevent proxy handshake errors
-    session.verify = False
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-else:
-    print("WARNING: SCRAPERAPI_KEY not found. Running locally without proxy.")
-# -------------------------------------
+if not api_key:
+    print("WARNING: SCRAPERAPI_KEY not found. Operations will likely fail.")
 
-
-def get_html(url, method="GET", data=None):
-    """Download page with retry logic for dropped connections."""
-    for attempt in range(RETRIES + 1):
+def get_html(url, method="GET", data=None, retries=RETRIES, exit_on_fail=False):
+    """Download page via ScraperAPI REST endpoint with retry logic and ASP.NET POST support."""
+    if not api_key:
+        # Fallback local request if no API key present
         try:
             if method == "POST":
-                r = session.post(url, data=data, timeout=30, allow_redirects=True)
+                r = requests.post(url, data=data, headers=HEADERS, timeout=30)
             else:
-                r = session.get(url, timeout=30, allow_redirects=True)
+                r = requests.get(url, headers=HEADERS, timeout=30)
             r.raise_for_status()
             return r
+        except Exception as e:
+            print(f"  Direct fetch failed: {e}")
+            return None
+
+    proxy_url = "https://api.scraperapi.com/"
+    payload = {
+        'api_key': api_key,
+        'url': url,
+        'premium': 'true',        
+        'country_code': 'pk',     
+        'render': 'true',         
+        'keep_headers': 'true'
+    }
+
+    for attempt in range(retries + 1):
+        try:
+            if method == "POST":
+                r = requests.post(proxy_url, params=payload, headers=HEADERS, data=data, timeout=90)
+            else:
+                r = requests.get(proxy_url, params=payload, headers=HEADERS, timeout=90)
+            
+            if r.status_code == 200:
+                return r
+            print(f"  Fetch attempt {attempt + 1}/{retries + 1} failed: Status {r.status_code}. Retrying...")
+            time.sleep(3)
         except requests.RequestException as e:
-            print(f"  failed: {type(e).__name__}")
-            if attempt < RETRIES:
-                print(f"  retry {attempt + 1}/{RETRIES}...")
-                time.sleep(10)
+            print(f"  failed: {type(e).__name__} ({e})")
+            if attempt < retries:
+                print(f"  retry {attempt + 1}/{retries}...")
+                time.sleep(5)
+
+    if exit_on_fail:
+        print(f"⚠️ Failed to reach {url} after retries. Exiting gracefully without failing workflow.")
+        sys.exit(0)
     return None
 
 
@@ -99,7 +112,7 @@ def parse_experience(text):
 
 def fetch_list():
     """Scrapes the main list lightly to get metadata without doing deep POSTs yet."""
-    res = get_html(START_URL)
+    res = get_html(START_URL, exit_on_fail=True)
     if not res:
         sys.exit("Failed to reach PPSC landing page.")
     

@@ -21,7 +21,6 @@ from datetime import datetime, date
 from urllib.parse import urljoin
 
 import requests
-import urllib3
 from bs4 import BeautifulSoup
 
 try:                               # read SUPABASE_* from the .env file if python-dotenv is installed
@@ -31,7 +30,6 @@ except ImportError:
     pass
 
 BASE = "https://jobs.punjab.gov.pk/new_recruit/jobs"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
 DELAY = 1.5                      # seconds between detail-page requests
 LINKS_FILE = "job_links.json"
 PAGES_DIR = "pages"
@@ -42,28 +40,49 @@ DB_TABLE = os.getenv("SUPABASE_TABLE", "punjab_jobs_portal")  # table for this s
 DB_HARD_DELETE = False           # False = expired jobs get is_active=false (soft delete)
                                  # True  = expired jobs are deleted from the table
 
-# --- SCRAPERAPI PROXY TUNNEL SETUP ---
-session = requests.Session()
-session.headers.update(HEADERS)
-
+# --- SCRAPERAPI REST ENDPOINT SETUP ---
 api_key = os.getenv("SCRAPERAPI_KEY")
-if api_key:
-    print("Cloud Proxy Active: Routing traffic through ScraperAPI (Sticky IP)...")
-    proxy_url = f"http://scraperapi.session_number=123:{api_key}@proxy-server.scraperapi.com:8001"
-    session.proxies.update({
-        "http": proxy_url,
-        "https": proxy_url
-    })
-    session.verify = False
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-else:
-    print("WARNING: SCRAPERAPI_KEY not found. Running locally without proxy.")
-# -------------------------------------
+if not api_key:
+    print("WARNING: SCRAPERAPI_KEY not found. Operations will likely fail.")
+
+def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool = False) -> str:
+    """Routes the request through ScraperAPI REST endpoint with premium targeting."""
+    proxy_url = "https://api.scraperapi.com/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    }
+    payload = {
+        'api_key': api_key,
+        'url': target_url,
+        'premium': 'true',        
+        'country_code': 'pk',     
+        'render': 'true',         
+        'keep_headers': 'true'
+    }
+    
+    for attempt in range(retries):
+        try:
+            r = requests.get(proxy_url, headers=headers, params=payload, timeout=90)
+            if r.status_code == 200:
+                return r.text
+            print(f"  Fetch attempt {attempt + 1}/{retries} failed: Status {r.status_code}. Retrying...")
+            time.sleep(3)
+        except requests.exceptions.RequestException as e:
+            print(f"  Fetch attempt {attempt + 1}/{retries} network error: {e}. Retrying...")
+            time.sleep(3)
+            
+    error_msg = f"Failed to fetch {target_url} after {retries} attempts."
+    if exit_on_fail:
+        # Exit cleanly (0) instead of crashing the GitHub Action if the portal is completely down
+        print(f"⚠️ {error_msg} Exiting gracefully without failing workflow.")
+        sys.exit(0) 
+    else:
+        # Raise exception for detail pages so the main loop can mark it as failed and continue
+        raise Exception(error_msg)
 
 
 # ------------------------------------------------------------------ fetching
 LIST_DATE_RE = re.compile(r"\b(\d{1,2}-[A-Za-z]{3}-\d{4})\b")   # 18-Oct-2026
-
 
 def list_date(tr):
     """Last apply date shown in the list row, as YYYY-MM-DD (or None)."""
@@ -78,44 +97,26 @@ def list_date(tr):
         return None
 
 
-def fetch_list(retries=2):
-    """Fetches the main job listing through ScraperAPI with retry handling."""
-    for attempt in range(retries):
-        try:
-            r = session.get(BASE, timeout=60)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "lxml")
-            live = {}
-            for a in soup.find_all("a", href=re.compile(r"job_detail")):
-                url = urljoin(BASE, a["href"])
-                slug = url.rstrip("/").split("/")[-1]
-                if slug not in live:
-                    live[slug] = {
-                        "title": a.get_text(strip=True), 
-                        "url": url,
-                        "last_date": list_date(a.find_parent("tr"))
-                    }
-            return live
-        except requests.RequestException as e:
-            print(f"  List fetch attempt {attempt + 1}/{retries} failed: {e}")
-            if attempt < retries - 1:
-                time.sleep(5)
-    
-    sys.exit("Failed to reach Punjab Job Portal list page after multiple retries.")
+def fetch_list():
+    """Fetches the main job listing through ScraperAPI."""
+    html = fetch_via_scraperapi(BASE, exit_on_fail=True)
+    soup = BeautifulSoup(html, "lxml")
+    live = {}
+    for a in soup.find_all("a", href=re.compile(r"job_detail")):
+        url = urljoin(BASE, a["href"])
+        slug = url.rstrip("/").split("/")[-1]
+        if slug not in live:
+            live[slug] = {
+                "title": a.get_text(strip=True), 
+                "url": url,
+                "last_date": list_date(a.find_parent("tr"))
+            }
+    return live
 
 
-def fetch_page(url, retries=2):
-    """Fetches individual detail pages with 60s timeout and retries."""
-    for attempt in range(retries):
-        try:
-            r = session.get(url, timeout=60)
-            r.raise_for_status()
-            return r.text
-        except requests.RequestException as e:
-            print(f"  Page fetch attempt {attempt + 1}/{retries} failed: {e}")
-            if attempt < retries - 1:
-                time.sleep(5)
-    raise Exception(f"Failed to fetch {url} after {retries} attempts.")
+def fetch_page(url):
+    """Fetches individual detail pages."""
+    return fetch_via_scraperapi(url, exit_on_fail=False)
 
 
 # ------------------------------------------------------------------- parsing
