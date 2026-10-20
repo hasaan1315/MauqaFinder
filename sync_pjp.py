@@ -1,8 +1,6 @@
 """
-sync_jobs.py - keep the Supabase table raw.punjab_jobs_portal in sync with
-https://jobs.punjab.gov.pk/new_recruit/jobs
-
-Needs a .env file with SUPABASE_URL, SUPABASE_SECRET_KEY, and SCRAPERAPI_KEY.
+sync_pjp.py - Master Sync for Punjab Jobs Portal
+Safely loops through all server-side pages (with JS disabled) to grab all 100+ active jobs.
 """
 import re, os, sys, json, time
 from datetime import datetime, date
@@ -32,8 +30,8 @@ api_key = os.getenv("SCRAPERAPI_KEY")
 if not api_key:
     print("WARNING: SCRAPERAPI_KEY not found. Operations will likely fail.")
 
-def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool = False, get_all_rows: bool = False) -> str:
-    """Routes the request through ScraperAPI REST endpoint with premium targeting and JS Injection."""
+def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool = False, render_js: bool = True) -> str:
+    """Routes the request through ScraperAPI REST endpoint with premium targeting."""
     proxy_url = "https://api.scraperapi.com/"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -43,17 +41,12 @@ def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool =
         'url': target_url,
         'premium': 'true',        
         'country_code': 'pk',     
-        'render': 'true',         
         'keep_headers': 'true'
     }
     
-    if get_all_rows:
-        # Inject JavaScript to command the DataTables API to load 150 rows and wait for the AJAX request
-        payload['js_instructions'] = json.dumps([
-            {"wait": 2000},
-            {"evaluate": "if (typeof $ !== 'undefined' && $.fn.dataTable) { $('.dataTable').DataTable().page.len(150).draw(); } else { var sel = document.querySelector('select[name$=\\'_length\\']'); if(sel) { sel.value = '100'; sel.dispatchEvent(new Event('change')); } }"},
-            {"wait": 4000}
-        ])
+    # Toggle JS rendering
+    if render_js:
+        payload['render'] = 'true'
         
     for attempt in range(retries):
         try:
@@ -78,7 +71,6 @@ def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool =
 LIST_DATE_RE = re.compile(r"\b(\d{1,2}-[A-Za-z]{3}-\d{4})\b")
 
 def list_date(tr):
-    """Last apply date shown in the list row, as YYYY-MM-DD (or None)."""
     if tr is None:
         return None
     m = LIST_DATE_RE.search(tr.get_text(" ", strip=True))
@@ -91,28 +83,45 @@ def list_date(tr):
 
 
 def fetch_list():
-    """Fetches the main job listing using JS Injection to grab all jobs instantly."""
-    print("Injecting JS to force DataTables to load all jobs...")
-    html = fetch_via_scraperapi(BASE, exit_on_fail=True, get_all_rows=True)
-    soup = BeautifulSoup(html, "lxml")
+    """Fetches the main job listing by paginating with JS explicitly disabled."""
     live = {}
+    page = 1
     
-    for a in soup.find_all("a", href=re.compile(r"job_detail")):
-        url = urljoin(BASE, a["href"])
-        slug = url.rstrip("/").split("/")[-1]
-        if slug not in live:
-            live[slug] = {
-                "title": a.get_text(strip=True), 
-                "url": url,
-                "last_date": list_date(a.find_parent("tr"))
-            }
+    while True:
+        paginated_url = f"{BASE}?page={page}"
+        print(f"Fetching PJP list page {page}...")
+        
+        # CRITICAL: render_js=False prevents the site's JS from forcing us back to page 1
+        html = fetch_via_scraperapi(paginated_url, exit_on_fail=(page == 1), render_js=False)
+        soup = BeautifulSoup(html, "lxml")
+        
+        jobs_on_page = 0
+        for a in soup.find_all("a", href=re.compile(r"job_detail")):
+            url = urljoin(BASE, a["href"])
+            slug = url.rstrip("/").split("/")[-1]
+            if slug not in live:
+                live[slug] = {
+                    "title": a.get_text(strip=True), 
+                    "url": url,
+                    "last_date": list_date(a.find_parent("tr"))
+                }
+                jobs_on_page += 1
+                
+        print(f" -> Found {jobs_on_page} jobs on page {page}")
+        
+        # Stop if we hit a page with zero jobs
+        if jobs_on_page == 0:
+            break
             
+        page += 1
+        time.sleep(2)
+        
     return live
 
 
 def fetch_page(url):
-    """Fetches individual detail pages."""
-    return fetch_via_scraperapi(url, exit_on_fail=False)
+    """Fetches individual detail pages (JS enabled to render full job descriptions)."""
+    return fetch_via_scraperapi(url, exit_on_fail=False, render_js=True)
 
 
 # ------------------------------------------------------------------- parsing
@@ -123,7 +132,6 @@ def get_lines(html):
     if a < 0:
         a = 0
     return text[a:b if b > a else None].split("\n")
-
 
 def norm(s):
     return re.sub(r"\s+", " ", s).rstrip(":").strip().lower()
@@ -357,6 +365,7 @@ def main(refresh=False, force=False):
         gone += [s for s in active if s in live and known[s]["last_date"]
                  and known[s]["last_date"] < today]
 
+    # safety: a broken page must not wipe the whole table
     if active and len(gone) > max(3, len(active) // 2) and not force:
         sys.exit(f"Would remove {len(gone)} of {len(active)} jobs. Looks wrong. "
                  "Nothing changed. If this is real, run: python sync_jobs.py --force")
