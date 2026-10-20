@@ -45,7 +45,7 @@ api_key = os.getenv("SCRAPERAPI_KEY")
 if not api_key:
     print("WARNING: SCRAPERAPI_KEY not found. Operations will likely fail.")
 
-def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool = False) -> str:
+def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool = False, render_js: bool = True) -> str:
     """Routes the request through ScraperAPI REST endpoint with premium targeting."""
     proxy_url = "https://api.scraperapi.com/"
     headers = {
@@ -56,10 +56,13 @@ def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool =
         'url': target_url,
         'premium': 'true',        
         'country_code': 'pk',     
-        'render': 'true',         
         'keep_headers': 'true'
     }
     
+    # Toggle JS rendering (False for the main list, True for detail pages)
+    if render_js:
+        payload['render'] = 'true'
+        
     for attempt in range(retries):
         try:
             r = requests.get(proxy_url, headers=headers, params=payload, timeout=90)
@@ -98,43 +101,28 @@ def list_date(tr):
 
 
 def fetch_list():
-    """Fetches the main job listing by looping through all paginated pages."""
+    """Fetches the main job listing (Raw HTML bypasses DataTables JS truncation)."""
+    # Fetch WITHOUT executing JavaScript (render_js=False) so we get all 100+ rows instantly
+    html = fetch_via_scraperapi(BASE, exit_on_fail=True, render_js=False)
+    soup = BeautifulSoup(html, "lxml")
     live = {}
-    page = 1
     
-    while True:
-        # Append pagination parameter to the URL
-        paginated_url = f"{BASE}?page={page}"
-        print(f"Fetching PJP list page {page}...")
-        
-        # Fetch the page (only exit completely if the very first page fails)
-        html = fetch_via_scraperapi(paginated_url, exit_on_fail=(page == 1))
-        soup = BeautifulSoup(html, "lxml")
-        
-        jobs_found_on_page = 0
-        for a in soup.find_all("a", href=re.compile(r"job_detail")):
-            url = urljoin(BASE, a["href"])
-            slug = url.rstrip("/").split("/")[-1]
-            if slug not in live:
-                live[slug] = {
-                    "title": a.get_text(strip=True), 
-                    "url": url,
-                    "last_date": list_date(a.find_parent("tr"))
-                }
-                jobs_found_on_page += 1
-        
-        # If no new jobs were found on the page, we have reached the end of the list
-        if jobs_found_on_page == 0:
-            break
+    for a in soup.find_all("a", href=re.compile(r"job_detail")):
+        url = urljoin(BASE, a["href"])
+        slug = url.rstrip("/").split("/")[-1]
+        if slug not in live:
+            live[slug] = {
+                "title": a.get_text(strip=True), 
+                "url": url,
+                "last_date": list_date(a.find_parent("tr"))
+            }
             
-        page += 1
-        time.sleep(2) # Brief pause between page requests to avoid rate limits
-        
     return live
 
 
 def fetch_page(url):
     """Fetches individual detail pages."""
+    # render_js defaults to True here, which is needed to execute the "saveJob" onclick scripts if necessary
     return fetch_via_scraperapi(url, exit_on_fail=False)
 
 
