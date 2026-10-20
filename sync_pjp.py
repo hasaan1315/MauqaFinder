@@ -1,5 +1,14 @@
 """
-sync_jobs.py - Master Sync for Punjab Jobs Portal with DataTable JS Injection (-1 rows)
+sync_pjp.py - Master Sync for Punjab Jobs Portal.
+
+Listing strategy:
+  * render=false -> server-rendered HTML, contains EVERY job row.
+  * render=true  -> JS-rendered DOM, contains only the first page of rows but
+                    exposes the authoritative total in the pagination footer
+                    ("Showing 1 to 10 of 102 entries").
+
+Both are fetched and the parsed row count is required to match the
+authoritative total before any job is retired from the database.
 """
 import re, os, sys, json, time
 from datetime import datetime, date
@@ -29,8 +38,14 @@ api_key = os.getenv("SCRAPERAPI_KEY")
 if not api_key:
     print("WARNING: SCRAPERAPI_KEY not found. Operations will likely fail.")
 
-def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool = False, get_all_rows: bool = False) -> str:
-    """Routes request through ScraperAPI with JS injection to expand DataTables to ALL rows (-1)."""
+def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool = False,
+                        render: bool = False) -> str:
+    """Fetch a URL through ScraperAPI.
+
+    render=False -> plain server-rendered HTML (every table row is present).
+    render=True  -> JS-rendered DOM (DataTables pagination footer shows the
+                    authoritative total number of entries).
+    """
     proxy_url = "https://api.scraperapi.com/"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -38,20 +53,12 @@ def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool =
     payload = {
         'api_key': api_key,
         'url': target_url,
-        'premium': 'true',        
-        'country_code': 'pk',     
-        'render': 'true',         
+        'premium': 'true',
+        'country_code': 'pk',
+        'render': 'true' if render else 'false',
         'keep_headers': 'true'
     }
-    
-    # Use -1 to command DataTables to load ALL entries onto a single page
-    if get_all_rows:
-        payload['js_instructions'] = json.dumps([
-            {"wait": 3000},
-            {"evaluate": "if (typeof jQuery !== 'undefined' && jQuery('.dataTable').length) { jQuery('.dataTable').DataTable().page.len(-1).draw(); } else { var sel = document.querySelector('select[name$=\"_length\"]'); if(sel) { sel.value = '-1'; sel.dispatchEvent(new Event('change')); } }"},
-            {"wait": 5000}
-        ])
-        
+
     for attempt in range(retries):
         try:
             r = requests.get(proxy_url, headers=headers, params=payload, timeout=90)
@@ -62,11 +69,11 @@ def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool =
         except requests.exceptions.RequestException as e:
             print(f"  Fetch attempt {attempt + 1}/{retries} network error: {e}. Retrying...")
             time.sleep(3)
-            
+
     error_msg = f"Failed to fetch {target_url} after {retries} attempts."
     if exit_on_fail:
         print(f"⚠️ {error_msg} Exiting gracefully without failing workflow.")
-        sys.exit(0) 
+        sys.exit(0)
     else:
         raise Exception(error_msg)
 
@@ -86,48 +93,132 @@ def list_date(tr):
         return None
 
 
-def fetch_list():
-    """Fetch PJP listing by expanding all rows via DataTable JS injection."""
-    print("Fetching PJP listing through ScraperAPI...")
+class ListingError(Exception):
+    """Raised when the scraped listing cannot be trusted."""
 
-    html = fetch_via_scraperapi(
-        BASE,
-        exit_on_fail=False,
-        get_all_rows=True,
-    )
+
+# "Showing 1 to 10 of 102 entries"  ->  102
+TOTAL_RE = re.compile(r"of\s+([\d,]+)\s+(?:entr(?:y|ies)|records?|jobs?)", re.I)
+
+
+def _listing_table(soup):
+    """Return the jobs table element of a listing page (or None)."""
+    table = soup.find("table", id="myTable")
+    if table is None:
+        table = soup.find("table", class_=re.compile(r"dataTable", re.I))
+    return table
+
+
+def parse_listing(html):
+    """Parse a full (server-rendered) listing page into {slug: {...}}.
+
+    Raises ListingError when the page is not a usable jobs listing.
+    """
+    if not html or "<html" not in html.lower():
+        raise ListingError("listing response is not an HTML document")
 
     soup = BeautifulSoup(html, "lxml")
+    table = _listing_table(soup)
+    if table is None:
+        raise ListingError("listing page has no jobs table (myTable)")
+
+    body = table.find("tbody")
+    rows = body.find_all("tr") if body is not None else table.find_all("tr")
+    if not rows:
+        raise ListingError("listing table is empty")
+
     live = {}
-
-    links = soup.find_all(
-        "a",
-        href=re.compile(r"job_detail", re.I)
-    )
-    print(f"Job-detail links found: {len(links)}")
-
-    for a in links:
+    rows_without_link = 0
+    for tr in rows:
+        a = tr.find("a", href=re.compile(r"job_detail", re.I))
+        if a is None:
+            rows_without_link += 1
+            continue
         href = a.get("href")
         if not href:
             continue
-
         url = urljoin(BASE, href)
         slug = url.rstrip("/").split("/")[-1]
-
         if not slug or slug in live:
             continue
-
         live[slug] = {
             "title": a.get_text(" ", strip=True),
             "url": url,
-            "last_date": list_date(a.find_parent("tr")),
+            "last_date": list_date(tr),
         }
 
+    if not live:
+        raise ListingError("no job-detail links found in the listing table")
+    if rows_without_link:
+        print(f"  WARNING: {rows_without_link} of {len(rows)} table rows had no job link")
+    return live, len(rows)
+
+
+def fetch_authoritative_total():
+    """Fetch the rendered listing and read the authoritative row count.
+
+    The JS-rendered page only shows the first page of rows, but its
+    DataTables footer states the real total ("Showing 1 to 10 of 102 entries").
+    Returns None when the total cannot be determined.
+    """
+    try:
+        html = fetch_via_scraperapi(BASE, exit_on_fail=False, render=True)
+    except Exception as e:
+        print(f"  WARNING: could not fetch the rendered listing for the total: {e}")
+        return None
+
+    m = TOTAL_RE.search(html)
+    if not m:
+        try:
+            text = BeautifulSoup(html, "lxml").get_text(" ", strip=True)
+            m = TOTAL_RE.search(text)
+        except Exception:
+            m = None
+    if not m:
+        print("  WARNING: the rendered listing did not contain a pagination total")
+        return None
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def fetch_list():
+    """Fetch and validate the PJP listing.
+
+    Returns (live, total) where `live` maps slug -> job info and `total` is
+    the authoritative number of entries (None when it could not be read).
+    """
+    print("Fetching PJP listing through ScraperAPI (server-rendered)...")
+    try:
+        html = fetch_via_scraperapi(BASE, exit_on_fail=False, render=False)
+    except Exception as e:
+        sys.exit(f"Could not fetch the PJP listing: {e}\nNothing was changed.")
+
+    try:
+        live, row_count = parse_listing(html)
+    except ListingError as e:
+        sys.exit(f"Listing looks broken: {e}\nNothing was changed.")
+
+    print(f"Job-detail links found: {len(live)} (table rows: {row_count})")
+
+    print("Fetching the authoritative total from the rendered listing...")
+    total = fetch_authoritative_total()
+    if total is None:
+        print("  Total unavailable -> removals will be skipped this run.")
+    else:
+        print(f"Authoritative total on site: {total}")
+        if len(live) != total:
+            print(f"  WARNING: parsed {len(live)} jobs but the site reports {total}. "
+                  "The listing is incomplete or changed mid-run "
+                  "-> removals will be skipped this run.")
+
     print(f"Unique jobs extracted: {len(live)}")
-    return live
+    return live, total
 
 
 def fetch_page(url):
-    return fetch_via_scraperapi(url, exit_on_fail=False, get_all_rows=False)
+    return fetch_via_scraperapi(url, exit_on_fail=False, render=False)
 
 
 # ------------------------------------------------------------------- parsing
@@ -332,7 +423,7 @@ def db_retire(db, ids, tbl=None):
 
 # ---------------------------------------------------------------------- sync
 def main(refresh=False, force=False):
-    live = fetch_list()
+    live, total = fetch_list()
     print("Listed on site:", len(live))
     if not live:
         sys.exit("No jobs found on the site. Stopping. Nothing was changed.")
@@ -360,12 +451,29 @@ def main(refresh=False, force=False):
                   "(date format difference?). Updates skipped. "
                   "Use --refresh to re-scrape everything.")
             changed = []
-    gone = [s for s in active if s not in live]                                
+    # ---- completeness gate -----------------------------------------------
+    # Retiring a job is only safe when the scraped listing is provably
+    # complete. The server-rendered listing is complete only when its row
+    # count matches the authoritative total reported by the rendered page.
+    listing_complete = total is not None and len(live) == total
+    if not listing_complete and not force:
+        if total is None:
+            print("SAFETY: the authoritative total could not be read "
+                  "-> no job will be retired in this run.")
+        else:
+            print(f"SAFETY: scraped {len(live)} jobs but the site reports {total} "
+                  "-> no job will be retired in this run.")
+
+    gone = [s for s in active if s not in live]
 
     if DROP_PAST_DEADLINE:
         today = date.today().isoformat()
         gone += [s for s in active if s in live and known[s]["last_date"]
                  and known[s]["last_date"] < today]
+
+    if not listing_complete and not force:
+        # the listing may be truncated: only keep deadline-driven removals
+        gone = [s for s in gone if s in live]
 
     # safety: a broken page must not wipe the whole table
     if active and len(gone) > max(3, len(active) // 2) and not force:
@@ -417,9 +525,13 @@ def main(refresh=False, force=False):
         if os.path.exists(p):
             os.remove(p)
 
-    with open(LINKS_FILE, "w", encoding="utf-8") as f:
-        json.dump([{"title": v["title"], "url": v["url"]} for v in live.values()],
-                  f, ensure_ascii=False, indent=2)
+    if listing_complete or force:
+        with open(LINKS_FILE, "w", encoding="utf-8") as f:
+            json.dump([{"title": v["title"], "url": v["url"]} for v in live.values()],
+                      f, ensure_ascii=False, indent=2)
+    else:
+        print(f"SAFETY: {LINKS_FILE} was not overwritten "
+              "(the listing could not be verified as complete).")
 
     active_now = len((active - set(gone)) | {r["id"] for r in rows})
     print(f"\nNew: {c_new} | Reactivated: {c_back} | Updated: {c_upd} | "
