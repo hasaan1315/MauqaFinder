@@ -3,18 +3,6 @@ sync_jobs.py - keep the Supabase table raw.punjab_jobs_portal in sync with
 https://jobs.punjab.gov.pk/new_recruit/jobs
 
 Needs a .env file with SUPABASE_URL, SUPABASE_SECRET_KEY, and SCRAPERAPI_KEY.
-
-Every run compares the jobs listed on the site with the jobs stored in the table:
-
-  listed on site, NOT in table             -> INSERT     (download page, parse, add)
-  listed on site, inactive in table        -> REACTIVATE (re-download, update, is_active=true)
-  listed on site, last date changed        -> UPDATE     (re-download, update)
-  active in table, NOT listed anymore      -> DEACTIVATE (is_active=false) or DELETE
-  everything else                          -> nothing, no download
-
-Run:   python sync_jobs.py
-       python sync_jobs.py --refresh   (re-download and re-parse ALL listed jobs)
-       python sync_jobs.py --force     (allow removing/updating many jobs at once)
 """
 import re, os, sys, json, time
 from datetime import datetime, date
@@ -23,30 +11,29 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-try:                               # read SUPABASE_* from the .env file if python-dotenv is installed
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
 BASE = "https://jobs.punjab.gov.pk/new_recruit/jobs"
-DELAY = 1.5                      # seconds between detail-page requests
+DELAY = 1.5                      
 LINKS_FILE = "job_links.json"
 PAGES_DIR = "pages"
-DROP_PAST_DEADLINE = False       # True = also remove jobs whose last date has passed
-DETECT_CHANGES = True            # re-scrape a job when its last date on the list page changed
-DB_SCHEMA = os.getenv("SUPABASE_SCHEMA", "raw")             # Supabase schema (RAW layer)
-DB_TABLE = os.getenv("SUPABASE_TABLE", "punjab_jobs_portal")  # table for this source
-DB_HARD_DELETE = False           # False = expired jobs get is_active=false (soft delete)
-                                 # True  = expired jobs are deleted from the table
+DROP_PAST_DEADLINE = False       
+DETECT_CHANGES = True            
+DB_SCHEMA = os.getenv("SUPABASE_SCHEMA", "raw")             
+DB_TABLE = os.getenv("SUPABASE_TABLE", "punjab_jobs_portal")  
+DB_HARD_DELETE = False           
 
 # --- SCRAPERAPI REST ENDPOINT SETUP ---
 api_key = os.getenv("SCRAPERAPI_KEY")
 if not api_key:
     print("WARNING: SCRAPERAPI_KEY not found. Operations will likely fail.")
 
-def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool = False, render_js: bool = True) -> str:
-    """Routes the request through ScraperAPI REST endpoint with premium targeting."""
+def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool = False, get_all_rows: bool = False) -> str:
+    """Routes the request through ScraperAPI REST endpoint with premium targeting and JS Injection."""
     proxy_url = "https://api.scraperapi.com/"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -56,12 +43,17 @@ def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool =
         'url': target_url,
         'premium': 'true',        
         'country_code': 'pk',     
+        'render': 'true',         
         'keep_headers': 'true'
     }
     
-    # Toggle JS rendering (False for the main list, True for detail pages)
-    if render_js:
-        payload['render'] = 'true'
+    if get_all_rows:
+        # Inject JavaScript to command the DataTables API to load 150 rows and wait for the AJAX request
+        payload['js_instructions'] = json.dumps([
+            {"wait": 2000},
+            {"evaluate": "if (typeof $ !== 'undefined' && $.fn.dataTable) { $('.dataTable').DataTable().page.len(150).draw(); } else { var sel = document.querySelector('select[name$=\\'_length\\']'); if(sel) { sel.value = '100'; sel.dispatchEvent(new Event('change')); } }"},
+            {"wait": 4000}
+        ])
         
     for attempt in range(retries):
         try:
@@ -76,16 +68,14 @@ def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool =
             
     error_msg = f"Failed to fetch {target_url} after {retries} attempts."
     if exit_on_fail:
-        # Exit cleanly (0) instead of crashing the GitHub Action if the portal is completely down
         print(f"⚠️ {error_msg} Exiting gracefully without failing workflow.")
         sys.exit(0) 
     else:
-        # Raise exception for detail pages so the main loop can mark it as failed and continue
         raise Exception(error_msg)
 
 
 # ------------------------------------------------------------------ fetching
-LIST_DATE_RE = re.compile(r"\b(\d{1,2}-[A-Za-z]{3}-\d{4})\b")   # 18-Oct-2026
+LIST_DATE_RE = re.compile(r"\b(\d{1,2}-[A-Za-z]{3}-\d{4})\b")
 
 def list_date(tr):
     """Last apply date shown in the list row, as YYYY-MM-DD (or None)."""
@@ -101,9 +91,9 @@ def list_date(tr):
 
 
 def fetch_list():
-    """Fetches the main job listing (Raw HTML bypasses DataTables JS truncation)."""
-    # Fetch WITHOUT executing JavaScript (render_js=False) so we get all 100+ rows instantly
-    html = fetch_via_scraperapi(BASE, exit_on_fail=True, render_js=False)
+    """Fetches the main job listing using JS Injection to grab all jobs instantly."""
+    print("Injecting JS to force DataTables to load all jobs...")
+    html = fetch_via_scraperapi(BASE, exit_on_fail=True, get_all_rows=True)
     soup = BeautifulSoup(html, "lxml")
     live = {}
     
@@ -122,7 +112,6 @@ def fetch_list():
 
 def fetch_page(url):
     """Fetches individual detail pages."""
-    # render_js defaults to True here, which is needed to execute the "saveJob" onclick scripts if necessary
     return fetch_via_scraperapi(url, exit_on_fail=False)
 
 
@@ -139,15 +128,12 @@ def get_lines(html):
 def norm(s):
     return re.sub(r"\s+", " ", s).rstrip(":").strip().lower()
 
-
-# if the "value" line is really another label, the field is empty
 LABELS = {"division", "district", "industry", "project", "total positions",
           "employment status", "role", "job posted", "level", "last date to apply",
           "gender", "age", "preferred candidates", "years of experience",
           "degree level", "years of education", "degree area", "email address",
           "send email", "important note", "back to listings", "apply for this job",
           "job description", "job details"}
-
 
 def val(lines, *labels):
     for lab in labels:
@@ -159,23 +145,19 @@ def val(lines, *labels):
                 return nxt
     return None
 
-
 def to_iso(s):
     try:
         d = datetime.strptime(s, "%d-%m-%Y").date()
-        return None if d.year <= 1970 else d.isoformat()   # 1970 = empty placeholder
+        return None if d.year <= 1970 else d.isoformat()   
     except Exception:
         return None
-
 
 def to_int(s):
     m = re.search(r"\d+", s or "")
     return int(m.group(0)) if m else None
 
-
 END = {"degree level", "years of education", "degree area", "important note",
        "apply for this job", "view advertisement", "sitemap", "preferred candidates"}
-
 
 def get_description(lines):
     for i, l in enumerate(lines):
@@ -192,22 +174,18 @@ def get_description(lines):
             return t or None
     return None
 
-
 EDU_RE = re.compile(r"^(.*?)\s*\((\d+)\s*years?\)\s*:?\s*$", re.I)
 EXP_END = {"email address", "send email", "×", "degree level", "years of education",
            "degree area", "important note", "apply for this job",
            "job description", "description"}
 
-
 def parse_edu_exp(lines):
-    # education: every "Degree (N years)" line -> keep the minimum
     edu = []
     for l in lines:
         m = EDU_RE.match(l.strip())
         if m:
             edu.append(int(m.group(2)))
 
-    # experience: ONLY inside the "Years of Experience" block
     exp = []
     start = next((i for i, l in enumerate(lines) if norm(l) == "years of experience"), None)
     if start is not None:
@@ -228,7 +206,6 @@ def parse_edu_exp(lines):
                     exp.append(item)
     return (min(edu) if edu else None), exp
 
-
 def get_degree_area(lines):
     for i, l in enumerate(lines):
         if norm(l) == "degree area":
@@ -242,7 +219,6 @@ def get_degree_area(lines):
             return out
     return []
 
-
 def get_age(lines):
     for i, l in enumerate(lines):
         if re.match(r"^age\b", norm(l)):
@@ -255,7 +231,6 @@ def get_age(lines):
                 return None, int(m.group(1))
     return None, None
 
-
 def salary_text(lines):
     v = val(lines, "Monthly Salary", "Salary", "Pay Scale", "Salary Range")
     if v:
@@ -263,7 +238,6 @@ def salary_text(lines):
     m = re.search(r"(?:Rs\.?|PKR)\s*[\d,]+(?:\s*(?:-|–|to)\s*(?:Rs\.?|PKR)?\s*[\d,]+)?",
                   " ".join(lines), re.I)
     return m.group(0) if m else None
-
 
 def parse_salary(text):
     if not text:
@@ -275,7 +249,6 @@ def parse_salary(text):
     if len(nums) == 1:
         return nums[0], nums[0]
     return min(nums), max(nums)
-
 
 def parse_job(slug, title, html):
     L = get_lines(html)
@@ -306,7 +279,6 @@ def parse_job(slug, title, html):
         "salary_max": smax,
     }
 
-
 # ------------------------------------------------------------------ database
 def get_db():
     url = os.getenv("SUPABASE_URL")
@@ -316,14 +288,12 @@ def get_db():
     from supabase import create_client
     return create_client(url, key)
 
-
 def table(db, tbl=None):
     return db.schema(DB_SCHEMA).table(tbl or DB_TABLE)
 
-
 def db_read(db, columns, only_active=False, tbl=None):
     out, start = [], 0
-    while True:                                      # PostgREST returns max 1000 rows per request
+    while True:                                      
         q = table(db, tbl).select(columns)
         if only_active:
             q = q.eq("is_active", True)
@@ -333,12 +303,10 @@ def db_read(db, columns, only_active=False, tbl=None):
             return out
         start += 1000
 
-
 def db_upsert(db, rows, tbl=None):
-    rows = [{**json.loads(json.dumps(r)), "is_active": True} for r in rows]   # int keys -> str
+    rows = [{**json.loads(json.dumps(r)), "is_active": True} for r in rows]   
     for i in range(0, len(rows), 100):
         table(db, tbl).upsert(rows[i:i + 100], on_conflict="id").execute()
-
 
 def db_retire(db, ids, tbl=None):
     if not ids:
@@ -347,7 +315,6 @@ def db_retire(db, ids, tbl=None):
         table(db, tbl).delete().in_("id", ids).execute()
     else:
         table(db, tbl).update({"is_active": False}).in_("id", ids).execute()
-
 
 # ---------------------------------------------------------------------- sync
 def main(refresh=False, force=False):
@@ -371,9 +338,9 @@ def main(refresh=False, force=False):
     print(f"In Supabase: {len(active)} active ({len(known)} total)")
 
     # ---- decide what to do, based on the table ----
-    new = [s for s in live if s not in known]                                  # INSERT
-    back = [s for s in live if s in known and not known[s]["is_active"]]       # REACTIVATE
-    changed = []                                                               # UPDATE
+    new = [s for s in live if s not in known]                                  
+    back = [s for s in live if s in known and not known[s]["is_active"]]       
+    changed = []                                                               
     if DETECT_CHANGES:
         changed = [s for s in live if s in active
                    and live[s]["last_date"] and known[s]["last_date"]
@@ -383,14 +350,13 @@ def main(refresh=False, force=False):
                   "(date format difference?). Updates skipped. "
                   "Use --refresh to re-scrape everything.")
             changed = []
-    gone = [s for s in active if s not in live]                                # DEACTIVATE
+    gone = [s for s in active if s not in live]                                
 
     if DROP_PAST_DEADLINE:
         today = date.today().isoformat()
         gone += [s for s in active if s in live and known[s]["last_date"]
                  and known[s]["last_date"] < today]
 
-    # safety: a broken page must not wipe the whole table
     if active and len(gone) > max(3, len(active) // 2) and not force:
         sys.exit(f"Would remove {len(gone)} of {len(active)} jobs. Looks wrong. "
                  "Nothing changed. If this is real, run: python sync_jobs.py --force")
@@ -408,13 +374,13 @@ def main(refresh=False, force=False):
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(html)
                 time.sleep(DELAY)
-            else:                              # page already saved earlier
+            else:                              
                 with open(path, encoding="utf-8") as f:
                     html = f.read()
             rows.append(parse_job(slug, live[slug]["title"], html))
         except Exception as e:
             failed += 1
-            print("FAIL", slug, e)             # not stored -> retried next run
+            print("FAIL", slug, e)             
             continue
         if slug in new:
             c_new += 1
@@ -449,7 +415,6 @@ def main(refresh=False, force=False):
           f"Removed: {len(gone)} | Failed: {failed} | Active now: {active_now}")
     if not (c_new or c_back or c_upd or gone or failed):
         print("No changes.")
-
 
 if __name__ == "__main__":
     main(refresh="--refresh" in sys.argv, force="--force" in sys.argv)
