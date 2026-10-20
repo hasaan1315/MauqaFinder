@@ -1,5 +1,5 @@
 """
-sync_jobs.py - Master Sync for Punjab Jobs Portal with DataTable JS Injection
+sync_jobs.py - Master Sync for Punjab Jobs Portal with DataTable JS Injection (-1 rows)
 """
 import re, os, sys, json, time
 from datetime import datetime, date
@@ -30,7 +30,7 @@ if not api_key:
     print("WARNING: SCRAPERAPI_KEY not found. Operations will likely fail.")
 
 def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool = False, get_all_rows: bool = False) -> str:
-    """Routes request through ScraperAPI with JS injection to expand DataTables to 200 rows."""
+    """Routes request through ScraperAPI with JS injection to expand DataTables to ALL rows (-1)."""
     proxy_url = "https://api.scraperapi.com/"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -44,12 +44,12 @@ def fetch_via_scraperapi(target_url: str, retries: int = 3, exit_on_fail: bool =
         'keep_headers': 'true'
     }
     
-    # Inject JavaScript to command DataTables to load all entries onto a single page
+    # Use -1 to command DataTables to load ALL entries onto a single page
     if get_all_rows:
         payload['js_instructions'] = json.dumps([
-            {"wait": 2000},
-            {"evaluate": "if (typeof $ !== 'undefined' && $.fn.dataTable) { $('.dataTable').DataTable().page.len(200).draw(); } else { var sel = document.querySelector('select[name$=\\'_length\\']'); if(sel) { sel.value = '200'; sel.dispatchEvent(new Event('change')); } }"},
-            {"wait": 4000}
+            {"wait": 3000},
+            {"evaluate": "if (typeof jQuery !== 'undefined' && jQuery('.dataTable').length) { jQuery('.dataTable').DataTable().page.len(-1).draw(); } else { var sel = document.querySelector('select[name$=\"_length\"]'); if(sel) { sel.value = '-1'; sel.dispatchEvent(new Event('change')); } }"},
+            {"wait": 5000}
         ])
         
     for attempt in range(retries):
@@ -86,9 +86,8 @@ def list_date(tr):
         return None
 
 
-
 def fetch_list():
-    """Fetch PJP listing and diagnose missing job links."""
+    """Fetch PJP listing by expanding all rows via DataTable JS injection."""
     print("Fetching PJP listing through ScraperAPI...")
 
     html = fetch_via_scraperapi(
@@ -99,17 +98,6 @@ def fetch_list():
 
     soup = BeautifulSoup(html, "lxml")
     live = {}
-
-    print(f"HTML length: {len(html):,} characters")
-    print(f"DataTables elements: {len(soup.select('.dataTable'))}")
-    print(f"Table rows: {len(soup.select('table tr'))}")
-    print(
-        "Pagination controls:",
-        len(soup.select(
-            ".paginate_button, .pagination, "
-            "[aria-label*='page']"
-        ))
-    )
 
     links = soup.find_all(
         "a",
@@ -136,7 +124,6 @@ def fetch_list():
 
     print(f"Unique jobs extracted: {len(live)}")
     return live
-
 
 
 def fetch_page(url):
