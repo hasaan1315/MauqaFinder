@@ -86,24 +86,57 @@ def list_date(tr):
         return None
 
 
+
 def fetch_list():
-    """Fetches all jobs by injecting JS to expand the DataTable view to 200 entries."""
-    print("Fetching PJP list and expanding DataTable view...")
-    html = fetch_via_scraperapi(BASE, exit_on_fail=True, get_all_rows=True)
+    """Fetch PJP listing and diagnose missing job links."""
+    print("Fetching PJP listing through ScraperAPI...")
+
+    html = fetch_via_scraperapi(
+        BASE,
+        exit_on_fail=False,
+        get_all_rows=True,
+    )
+
     soup = BeautifulSoup(html, "lxml")
     live = {}
-    
-    for a in soup.find_all("a", href=re.compile(r"job_detail")):
-        url = urljoin(BASE, a["href"])
+
+    print(f"HTML length: {len(html):,} characters")
+    print(f"DataTables elements: {len(soup.select('.dataTable'))}")
+    print(f"Table rows: {len(soup.select('table tr'))}")
+    print(
+        "Pagination controls:",
+        len(soup.select(
+            ".paginate_button, .pagination, "
+            "[aria-label*='page']"
+        ))
+    )
+
+    links = soup.find_all(
+        "a",
+        href=re.compile(r"job_detail", re.I)
+    )
+    print(f"Job-detail links found: {len(links)}")
+
+    for a in links:
+        href = a.get("href")
+        if not href:
+            continue
+
+        url = urljoin(BASE, href)
         slug = url.rstrip("/").split("/")[-1]
-        if slug not in live:
-            live[slug] = {
-                "title": a.get_text(strip=True), 
-                "url": url,
-                "last_date": list_date(a.find_parent("tr"))
-            }
-            
+
+        if not slug or slug in live:
+            continue
+
+        live[slug] = {
+            "title": a.get_text(" ", strip=True),
+            "url": url,
+            "last_date": list_date(a.find_parent("tr")),
+        }
+
+    print(f"Unique jobs extracted: {len(live)}")
     return live
+
 
 
 def fetch_page(url):
