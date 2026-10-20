@@ -98,19 +98,38 @@ def list_date(tr):
 
 
 def fetch_list():
-    """Fetches the main job listing through ScraperAPI."""
-    html = fetch_via_scraperapi(BASE, exit_on_fail=True)
-    soup = BeautifulSoup(html, "lxml")
+    """Fetches the main job listing by looping through all paginated pages."""
     live = {}
-    for a in soup.find_all("a", href=re.compile(r"job_detail")):
-        url = urljoin(BASE, a["href"])
-        slug = url.rstrip("/").split("/")[-1]
-        if slug not in live:
-            live[slug] = {
-                "title": a.get_text(strip=True), 
-                "url": url,
-                "last_date": list_date(a.find_parent("tr"))
-            }
+    page = 1
+    
+    while True:
+        # Append pagination parameter to the URL
+        paginated_url = f"{BASE}?page={page}"
+        print(f"Fetching PJP list page {page}...")
+        
+        # Fetch the page (only exit completely if the very first page fails)
+        html = fetch_via_scraperapi(paginated_url, exit_on_fail=(page == 1))
+        soup = BeautifulSoup(html, "lxml")
+        
+        jobs_found_on_page = 0
+        for a in soup.find_all("a", href=re.compile(r"job_detail")):
+            url = urljoin(BASE, a["href"])
+            slug = url.rstrip("/").split("/")[-1]
+            if slug not in live:
+                live[slug] = {
+                    "title": a.get_text(strip=True), 
+                    "url": url,
+                    "last_date": list_date(a.find_parent("tr"))
+                }
+                jobs_found_on_page += 1
+        
+        # If no new jobs were found on the page, we have reached the end of the list
+        if jobs_found_on_page == 0:
+            break
+            
+        page += 1
+        time.sleep(2) # Brief pause between page requests to avoid rate limits
+        
     return live
 
 
