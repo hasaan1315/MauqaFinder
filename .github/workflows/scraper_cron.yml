@@ -2,8 +2,8 @@ name: Daily Scraper Sync
 
 on:
   schedule:
-    # Runs at 01:17 UTC (6:17 AM Pakistan Standard Time) - Off-peak to avoid GitHub queue delays
-    - cron: '17 3 * * *'
+    # Runs at 01:13 UTC (6:13 AM Pakistan Standard Time)
+    - cron: '13 1 * * *'
   workflow_dispatch: # Allows manual trigger from GitHub UI
 
 jobs:
