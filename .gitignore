@@ -1,6 +1,22 @@
+# Environments
 .env
 .venv/
+
+# Python cache
 __pycache__/
-*.tmp
-jobs.backup.json
+*.pyc
+
+# Scraper Cache Directories
 pages/
+njp_pages/
+ppsc_pages/
+
+# Temp Data Dumps & Logs
+*.tmp
+*.json
+*.html
+*.txt
+
+# Exceptions
+!README.md
+!requirements.txt
