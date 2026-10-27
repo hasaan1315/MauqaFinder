@@ -114,7 +114,8 @@ def fetch_list():
     """Scrapes the main list lightly to get metadata without doing deep POSTs yet."""
     res = get_html(START_URL, exit_on_fail=True)
     if not res:
-        sys.exit("Failed to reach PPSC landing page.")
+        print("Failed to reach PPSC landing page.")
+        sys.exit(0)
     
     session_url = res.url 
     soup = BeautifulSoup(res.text, 'lxml')
@@ -266,14 +267,16 @@ def main(refresh=False, force=False):
     live = fetch_list()
     print("Listed on PPSC site:", len(live))
     if not live:
-        sys.exit("No jobs found on the site. Stopping. Nothing was changed.")
+        print("No jobs found on the site. Stopping. Nothing was changed.")
+        sys.exit(0)
 
     db = base.get_db()
     try:
         # Note: Your database uses "closing_date" for PPSC instead of "last_date_to_apply"
         saved = base.db_read(db, "id,is_active,closing_date", tbl=TABLE)
     except Exception as e:
-        sys.exit(f"Supabase connection error for {TABLE}: {e}")
+        print(f"Supabase connection error for {TABLE}: {e}")
+        sys.exit(1)
 
     known = {r["id"]: {"is_active": r["is_active"], "last_date": r["closing_date"]}
              for r in saved}
@@ -293,7 +296,8 @@ def main(refresh=False, force=False):
     gone = [s for s in active if s not in live]
 
     if active and len(gone) > max(3, len(active) // 2) and not force:
-        sys.exit(f"Would remove {len(gone)} PPSC jobs. Run with --force if intentional.")
+        print(f"Would remove {len(gone)} PPSC jobs. Run with --force if intentional.")
+        sys.exit(1)
 
     # ---- Fetching & Parsing Only What's Needed ----
     os.makedirs(PAGES_DIR, exist_ok=True)
@@ -347,7 +351,8 @@ def main(refresh=False, force=False):
         if gone:
             base.db_retire(db, gone, tbl=TABLE)
     except Exception as e:
-        sys.exit(f"Supabase write FAILED: {e}")
+        print(f"Supabase write FAILED: {e}")
+        sys.exit(1)
 
     # Clean up cached files for retired jobs
     for slug in gone:
