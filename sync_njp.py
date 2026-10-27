@@ -32,7 +32,7 @@ from bs4 import BeautifulSoup
 import sync_pjp as base                                  # database helpers
 
 LIST_URL = "https://njp.gov.pk/jobs/live"
-TABLE = "njp_jobs"                                        # raw.njp_jobs
+TABLE = "njp_jobs"                                       # raw.njp_jobs
 PAGES_DIR = "njp_pages"
 MAX_PAGES = 50
 HEADERS = {
@@ -243,7 +243,7 @@ def parse_age(text, bare="max"):
     if r:
         lo, hi = int(r.group(1)), int(r.group(2))
         return min(lo, hi), max(lo, hi)
-    n = re.search(r"(\d{1,2})", t)                                          # one bare number
+    n = re.search(r"(\d{1,2})", t)                                        # one bare number
     if not n:
         return None, None
     return (int(n.group(1)), None) if bare == "min" else (None, int(n.group(1)))
@@ -282,6 +282,19 @@ def parse_job(job_id, list_title, html):
         m = re.search(DATE, d or "")
         deadline = to_iso(m.group(1)) if m else None
 
+    # --- NEW: Location & Domicile Parsing ---
+    place_of_posting = "All Pakistan" # Default assumption
+    
+    # 1. Look for explicit "Job Location: City" in the text
+    loc_match = re.search(r"Job Location:\s*([A-Za-z\s,]+)(?:Test City|Gender|Job Description|$)", flat, re.I)
+    if loc_match:
+        place_of_posting = loc_match.group(1).strip()
+        
+    # 2. Override with strict domicile rules if present (Catches the NJP Balochistan portal)
+    if "Balochistan Domicile Required" in flat or "Balochistan Initiative" in flat:
+        place_of_posting = "Balochistan"
+    # -----------------------------------------
+
     return {
         "id": job_id,
         "title": title,
@@ -297,6 +310,7 @@ def parse_job(job_id, list_title, html):
         "job_posted": find_date(qo, "Posted"),
         "last_date_to_apply": deadline,
         "url": f"https://njp.gov.pk/jobs/{job_id}",
+        "place_of_posting": place_of_posting
     }
 
 
